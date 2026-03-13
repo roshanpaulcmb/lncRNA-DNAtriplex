@@ -7,3 +7,16 @@ browser full altGraph
 # in viewing window, priority = 20 position this as the second graph
 # Note, zero-relative, half-open coordinate system in use for bedGraph format
 track type=bedGraph name='HOTAIR_fragment1 TTS (1)' description='15-50' visibility=full color=200,100,0 altColor=0,100,200 priority=20
+chr7	5000077	5000081	1
+chr7	5000081	5000085	3
+chr7	5000085	5000089	4
+chr7	5000089	5000127	5
+chr7	5000128	5000136	2
+chr7	5000136	5000142	1
+chr7	5000190	5000204	1
+chr7	5000204	5000206	2
+chr7	5000206	5000228	4
+chr7	5000228	5000252	5
+chr7	5000252	5000256	4
+chr7	5000257	5000258	2
+chr7	5000258	5000277	1
