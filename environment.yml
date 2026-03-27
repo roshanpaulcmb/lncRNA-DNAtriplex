@@ -113,6 +113,7 @@ dependencies:
   - packaging=26.0=pyhcf101f3_0
   - pandas=3.0.1=py311h8032f78_0
   - pandocfilters=1.5.0=pyhd8ed1ab_0
+  - parasail-python=1.3.4=py311h6947f6e_6
   - parso=0.8.6=pyhcf101f3_0
   - pexpect=4.9.0=pyhd8ed1ab_1
   - pip=26.0.1=pyh8b19718_0
@@ -171,4 +172,5 @@ dependencies:
   - zeromq=4.3.5=h41580af_10
   - zipp=3.23.0=pyhcf101f3_1
   - zstd=1.5.7=hb78ec9c_6
-prefix: /net/dali/home/mscbio/rop174/yes/envs/lncRNA-DNAtriplex
+
+prefix: "/net/dali/home/mscbio/rop174/yes/envs/lncRNA-DNAtriplex"
