@@ -388,29 +388,51 @@ def _parse_gtf_attributes(attr_str: str) -> dict[str, str]:
 # 4. Load lncRNA sequences from LNCipedia FASTA
 # ---------------------------------------------------------------------------
 
-def load_lncrnas(fasta_path: str) -> dict[str, str]:
+
+def load_lncrnas(fasta_path: str) -> dict[str, dict[int, str]]:
     """
     Parse a LNCipedia FASTA file.
 
     LNCipedia FASTA headers look like:
-      >lnc-GENE-1:1   or   >LINC01234:2   (transcript_id : version)
+      >lnc-GENE-1:1   or   >LINC01234:2   (transcript_id:version)
 
     Returns
     -------
-    lncrna_seqs_dict : {transcript_id (str): sequence (str)}
+    lncrna_seqs_dict : {base_id (str): {version (int): sequence (str)}}
+        e.g. {"PIK3CD-AS2": {1: "ACGT...", 2: "ACGT..."}}
+
+    Entries whose version field is not a valid integer are stored under
+    version key 0 with a warning.
     """
     p = Path(fasta_path)
     if not p.exists():
         raise FileNotFoundError(f"lncRNA FASTA not found: {fasta_path}")
 
-    lncrna_seqs_dict: dict[str, str] = {}
+    lncrna_seqs_dict: dict[str, dict[int, str]] = {}
+
     for record in SeqIO.parse(str(p), "fasta"):
-        tid = record.id.split()[0]
-        lncrna_seqs_dict[tid] = str(record.seq).upper()
+        full_id = record.id.split()[0]   # e.g. "PIK3CD-AS2:1"
+        if ":" in full_id:
+            base_id, ver_str = full_id.rsplit(":", 1)
+            try:
+                version = int(ver_str)
+            except ValueError:
+                print(f"[WARNING] Non-integer version in ID '{full_id}'; storing as version 0.",
+                      file=sys.stderr)
+                version = 0
+        else:
+            # No version suffix at all — store as version 0
+            base_id = full_id
+            version = 0
 
-    print(f"[INFO] Loaded {len(lncrna_seqs_dict)} lncRNA transcripts.")
+        if base_id not in lncrna_seqs_dict:
+            lncrna_seqs_dict[base_id] = {}
+        lncrna_seqs_dict[base_id][version] = str(record.seq).upper()
+
+    n_transcripts = sum(len(v) for v in lncrna_seqs_dict.values())
+    print(f"[INFO] Loaded {len(lncrna_seqs_dict)} lncRNA base IDs "
+          f"({n_transcripts} total versioned transcripts).")
     return lncrna_seqs_dict
-
 
 # ---------------------------------------------------------------------------
 # Utilities

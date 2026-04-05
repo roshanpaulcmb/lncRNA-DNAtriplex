@@ -10,3 +10,7 @@ src/__pycache__/
 # Data
 data/
 
+# Slurm
+logs/
+*.stdout
+*.stderr

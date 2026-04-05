@@ -15,15 +15,22 @@ Usage:
     --assembly    assembly_report.txt \
     --mutations   data_mutations.txt \
     --lncrna      lncipedia_5_2_hc.fasta \
-    --outpath     ./results
+    --outpath     ./results \
+    --lncrna_ids  FENDRR LINC01234
+
+  # Or pass a file with one ID per line:
+  python alignment.py ... --lncrna_ids_file my_lncrnas.txt
 """
 
 import sys
 import os
+import gc
 import argparse
 import csv
 from datetime import datetime
 from dataclasses import dataclass
+from multiprocessing import Pool
+from pympler import asizeof
 from typing import List, Dict, Tuple
 
 from rules       import transfer_string, reverse_seq, complement
@@ -39,21 +46,21 @@ from data_loader import (load_mutations, load_chrom_map,
 
 @dataclass
 class Para:
-    rule:           int   = 0          # 0 = all rules
-    cut_length:     int   = 5000       # DNA chunk size
-    strand:         int   = 0          # 0=both, >0=parallel only, <0=anti only
-    overlap_length: int   = 100        # overlap between consecutive DNA chunks
+    rule:           int   = 0
+    cut_length:     int   = 5000
+    strand:         int   = 0
+    overlap_length: int   = 100
     min_score:      int   = 0
     detail_output:  bool  = False
-    nt_min:         int   = 20         # minimum triplex length (nt)
-    nt_max:         int   = 100000     # maximum triplex length (nt)
+    nt_min:         int   = 20
+    nt_max:         int   = 100000
     score_min:      float = 0.0
-    min_identity:   float = 60.0       # minimum % identity to keep
-    min_stability:  float = 1.0        # minimum mean stability score
-    penalty_t:      int   = -1000      # penalty for consecutive A's
-    penalty_c:      int   = 0          # penalty for consecutive G's
-    c_distance:     int   = 15         # clustering distance
-    c_length:       int   = 50         # clustering minimum length
+    min_identity:   float = 60.0
+    min_stability:  float = 1.0
+    penalty_t:      int   = -1000
+    penalty_c:      int   = 0
+    c_distance:     int   = 15
+    c_length:       int   = 50
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,7 +69,6 @@ class Para:
 
 def cut_sequence(seq: str, cut_length: int,
                  overlap_length: int) -> Tuple[List[str], List[int], int]:
-    """Split a long DNA sequence into overlapping chunks."""
     seqs_vec:       List[str] = []
     seqs_start_pos: List[int] = []
     pos = 0
@@ -74,7 +80,6 @@ def cut_sequence(seq: str, cut_length: int,
 
 
 def same_seq(seq: str) -> bool:
-    """Return True if the sequence is a homopolymer (uninformative)."""
     counts = {"A": 0, "C": 0, "G": 0, "T": 0, "U": 0, "N": 0}
     for ch in seq:
         if ch in counts:
@@ -102,21 +107,93 @@ def comp_key(t: Triplex) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# lncRNA selection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_lncrna_ids(
+    lncrna_seqs_dict: Dict[str, Dict[int, str]],
+    ids:              List[str] | None,
+    ids_file:         str | None,
+) -> List[str]:
+    """
+    Returns a flat list of "base_id:version" strings.
+
+    Resolution rules:
+      - "BASE_ID:N"  → use version N if it exists, else fall back to lowest.
+      - "BASE_ID"    → use the lowest available version for that base_id.
+      - base_id not in dict → warn and skip.
+    """
+    def lowest_version(base_id: str) -> int:
+        return min(lncrna_seqs_dict[base_id].keys())
+
+    def resolve_one(requested: str) -> str | None:
+        if ":" in requested:
+            base_id, ver_str = requested.rsplit(":", 1)
+            try:
+                version = int(ver_str)
+            except ValueError:
+                print(f"[WARNING] Could not parse version in '{requested}', skipping.",
+                      file=sys.stderr)
+                return None
+            if base_id not in lncrna_seqs_dict:
+                return None
+            if version not in lncrna_seqs_dict[base_id]:
+                low = lowest_version(base_id)
+                print(f"[WARNING] '{requested}' version {version} not found; "
+                      f"defaulting to lowest version {low}.", file=sys.stderr)
+                return f"{base_id}:{low}"
+            return f"{base_id}:{version}"
+        else:
+            if requested not in lncrna_seqs_dict:
+                return None
+            low = lowest_version(requested)
+            print(f"[INFO] No version specified for '{requested}'; "
+                  f"using lowest version {low}.")
+            return f"{requested}:{low}"
+
+    if not ids and not ids_file:
+        print("[ERROR] One of --lncrna_ids or --lncrna_ids_file must be supplied.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if ids:
+        requested_list = ids
+        source         = "--lncrna_ids"
+    else:
+        try:
+            with open(ids_file) as fh:
+                requested_list = [ln.strip() for ln in fh if ln.strip()]
+        except FileNotFoundError:
+            print(f"[ERROR] --lncrna_ids_file not found: {ids_file}", file=sys.stderr)
+            sys.exit(1)
+        source = f"--lncrna_ids_file ({ids_file})"
+
+    valid   = []
+    missing = []
+    for r in requested_list:
+        resolved = resolve_one(r)
+        if resolved:
+            valid.append(resolved)
+        else:
+            missing.append(r)
+
+    if missing:
+        print(f"[WARNING] {len(missing)} ID(s) from {source} not found: "
+              f"{missing[:10]}{'...' if len(missing) > 10 else ''}", file=sys.stderr)
+    if not valid:
+        print("[ERROR] No valid lncRNA IDs remain after filtering.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[INFO] {len(valid)} lncRNA(s) selected via {source}.")
+    return valid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LongTarget core
 # ─────────────────────────────────────────────────────────────────────────────
 
 def long_target(para: Para, rna_sequence: str,
                 dna_sequence: str) -> List[Triplex]:
-    """
-    Main alignment loop.
-
-    For every DNA chunk and every applicable triplex rule:
-      1. Transfer (encode) the DNA chunk via the rule            ← rules.py
-      2. Compute the statistical significance threshold          ← stats.py
-      3. Run SIM local alignment and collect triplex candidates  ← sim.py
-
-    Returns the filtered list of Triplex objects.
-    """
     chunks, start_positions, _ = cut_sequence(
         dna_sequence, para.cut_length, para.overlap_length)
 
@@ -124,10 +201,10 @@ def long_target(para: Para, rna_sequence: str,
 
     for i, dna_chunk in enumerate(chunks):
         dna_start = start_positions[i]
-        print(f"  DNA chunk @ {dna_start} ({len(dna_chunk)} bp) ...")
+        # print(f"  DNA chunk @ {dna_start} ({len(dna_chunk)} bp) ...")
 
         if same_seq(dna_chunk):
-            print("  Skipped (homopolymer)")
+            # print("  Skipped (homopolymer)")
             continue
 
         if para.strand >= 0:
@@ -170,24 +247,42 @@ def long_target(para: Para, rna_sequence: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multiprocessing worker  (module-level for pickling)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_pair(args_tuple) -> Tuple[str, str, Dict[str, List[Triplex]]]:
+    """
+    Worker for one (lnc_id, gene) pair.
+    lnc_id is a "base_id:version" string.
+    Returns (lnc_id, gene, condition_dict).
+    """
+    para, lnc_id, lnc_seq, gene, healthy_seq, gene_muts, mut_seqs = args_tuple
+
+    condition_dict: Dict[str, List[Triplex]] = {}
+
+    print(f"  [{lnc_id}] {gene} healthy ...", flush=True)
+    condition_dict["healthy"] = long_target(para, lnc_seq, healthy_seq)
+
+    for mut_idx, (mut, mutated_seq) in enumerate(zip(gene_muts, mut_seqs)):
+        if mutated_seq is None:
+            continue
+        mut_label = f"mut{mut_idx}_{mut.get('variant_class', 'unknown')}"
+        print(f"  [{lnc_id}] {gene} {mut_label} ...", flush=True)
+        condition_dict[mut_label] = long_target(para, lnc_seq, mutated_seq)
+
+    return lnc_id, gene, condition_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Report
 # ─────────────────────────────────────────────────────────────────────────────
 
 def report(
-    results:      Dict[str, Dict[str, Dict[str, List[Triplex]]]],
+    results:        Dict[str, Dict[str, Dict[str, List[Triplex]]]],
     mutations_dict: Dict,
-    outpath:      str,
-    report_name:  str = None,
+    outpath:        str,
+    report_name:    str = None,
 ) -> None:
-    """
-    Flatten the nested results dict and write a single CSV summary.
-
-    Output columns
-    --------------
-    lnc_id, gene, condition, variant_class, chromosome,
-    n_triplexes, mean_identity, mean_stability, mean_score,
-    min_nt, max_nt
-    """
     os.makedirs(outpath, exist_ok=True)
     if report_name is None:
         report_name = f"triplex_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -248,22 +343,27 @@ def report(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args(argv: List[str]) -> Tuple[Para, argparse.Namespace]:
-    parser = argparse.ArgumentParser(
-        description="LongTarget lncRNA triplex pipeline")
+    parser = argparse.ArgumentParser(description="LongTarget lncRNA triplex pipeline")
 
     # ── data loading ──────────────────────────────────────────────────────
-    parser.add_argument("--mutations",   nargs="+", required=True, metavar="MAF_FILE",
-                        help="One or more cBioPortal data_mutations.txt files.")
-    parser.add_argument("--genome",      required=True, metavar="FASTA",
-                        help="NCBI RefSeq genomic FASTA (.fna or .fna.gz).")
-    parser.add_argument("--annotation",  required=True, metavar="GTF",
-                        help="Matching NCBI RefSeq GTF annotation file.")
-    parser.add_argument("--assembly",    required=True, metavar="ASSEMBLY_REPORT",
-                        help="NCBI assembly report .txt file (one per reference genome).")
-    parser.add_argument("--lncrna",      required=True, metavar="FASTA",
-                        help="LNCipedia FASTA file.")
-    parser.add_argument("--outpath",     default="./results",
-                        help="Output directory (default: ./results).")
+    parser.add_argument("--mutations",  nargs="+", required=True, metavar="MAF_FILE")
+    parser.add_argument("--genome",     required=True, metavar="FASTA")
+    parser.add_argument("--annotation", required=True, metavar="GTF")
+    parser.add_argument("--assembly",   required=True, metavar="ASSEMBLY_REPORT")
+    parser.add_argument("--lncrna",     required=True, metavar="FASTA")
+
+    # ── lncRNA selection ──────────────────────────────────────────────────
+    lnc_group = parser.add_mutually_exclusive_group()
+    lnc_group.add_argument("--lncrna_ids",      nargs="+", metavar="ID",  default=None)
+    lnc_group.add_argument("--lncrna_ids_file", metavar="FILE",           default=None)
+
+    # ── runtime ───────────────────────────────────────────────────────────
+    parser.add_argument("--n_cores", type=int, default=1, metavar="N",
+                        help="Number of worker processes (default: 1).")
+
+    # ── reporting ─────────────────────────────────────────────────────────
+    parser.add_argument("--outpath",    default="./results")
+    parser.add_argument("--report_name", type=str, default=None)
 
     # ── alignment parameters ──────────────────────────────────────────────
     parser.add_argument("-r",  dest="rule",           type=int,   default=0)
@@ -312,11 +412,10 @@ def main(argv: List[str] = None) -> int:
 
     para, args = parse_args(argv)
 
-    # ── ensure output directory exists ───────────────────────────────────
     os.makedirs(args.outpath, exist_ok=True)
     print(f"Output directory: {args.outpath}")
 
-    # ── load dictionaries ─────────────────────────────────────────────────
+    # ── load data ─────────────────────────────────────────────────────────
     print("Loading mutated gene data ...")
     mutations_dict, gene_names = load_mutations(args.mutations)
 
@@ -331,62 +430,79 @@ def main(argv: List[str] = None) -> int:
         chrom_map      = chrom_map,
         mutations_dict = mutations_dict,
     )
+    del chrom_map, gene_names
+    gc.collect()
 
     print("Loading lncRNA sequences ...")
     lncrna_seqs_dict = load_lncrnas(args.lncrna)
 
+    # Restrict sequence dicts to only genes present in mutations_dict
+    shared_gene_set   = set(mutations_dict.keys()) & set(healthy_seqs_dict.keys())
+    healthy_seqs_dict = {g: healthy_seqs_dict[g] for g in shared_gene_set}
+    mutated_seqs_dict = {g: mutated_seqs_dict[g] for g in shared_gene_set
+                         if g in mutated_seqs_dict}
+    gc.collect()
+
+    # Resolve lncRNA IDs → flat list of "base_id:version" strings
+    test_lncrnas = resolve_lncrna_ids(
+        lncrna_seqs_dict,
+        ids      = args.lncrna_ids,
+        ids_file = args.lncrna_ids_file,
+    )
+
+    # Keep only the lncRNAs we will actually use: {lnc_id: sequence}
+    filtered_lncrna_seqs_dict = {}
+    for lnc_id in test_lncrnas:
+        base_id, ver_str = lnc_id.rsplit(":", 1)
+        filtered_lncrna_seqs_dict[lnc_id] = lncrna_seqs_dict[base_id][int(ver_str)]
+    del lncrna_seqs_dict
+    gc.collect()
+
     print(f"\n=== Data Summary ===")
     print(f"  Genes with mutations:     {len(mutations_dict)}")
     print(f"  Gene sequences retrieved: {len(healthy_seqs_dict)}")
-    print(f"  lncRNA transcripts:       {len(lncrna_seqs_dict)}")
+    print(f"  lncRNA transcripts:       {len(filtered_lncrna_seqs_dict)}")
 
-    # ── prepare gene/lncRNA lists ─────────────────────────────────────────
-    shared_genes = sorted(g for g in gene_names if g in healthy_seqs_dict)
-    lncrna_ids   = list(lncrna_seqs_dict.keys())
-
-    n_test  = 100
-    test_lncrnas = lncrna_ids[:n_test]
+    shared_genes = sorted(shared_gene_set)
 
     print(f"\n  Genes available for analysis: {len(shared_genes)}")
     print(f"  lncRNAs to test:              {len(test_lncrnas)}")
-    print()
+    print(f"  Workers:                      {args.n_cores}")
+    print(f"\n=== Memory Summary ===")
+    print(f"  healthy_seqs_dict: {asizeof.asizeof(healthy_seqs_dict) / 1e6:.2f} MB")
+    print(f"  mutated_seqs_dict: {asizeof.asizeof(mutated_seqs_dict) / 1e6:.2f} MB")
 
-    # ── main loop ─────────────────────────────────────────────────────────
-    # results : {lnc_id: {gene: {"healthy": [Triplex], mut_label: [Triplex], ...}}}
+    # ── build task list ───────────────────────────────────────────────────
+    tasks = [
+        (
+            para,
+            lnc_id,
+            filtered_lncrna_seqs_dict[lnc_id],
+            gene,
+            healthy_seqs_dict[gene],
+            mutations_dict[gene]["mutations"],
+            mutated_seqs_dict.get(gene, []),
+        )
+        for lnc_id in test_lncrnas
+        for gene   in shared_genes
+    ]
+
+    # ── run ───────────────────────────────────────────────────────────────
     loop_start = datetime.now()
-    print(f"Loop started at: {loop_start.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    print(f"\nLoop started at: {loop_start.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
+    with Pool(processes=args.n_cores) as pool:
+        task_results = pool.map(_run_pair, tasks)
+
+    # Re-nest results into {lnc_id: {gene: {condition: [Triplex]}}}
     results:     Dict[str, Dict[str, Dict[str, List[Triplex]]]] = {}
     total_pairs = 0
     total_hits  = 0
 
-    for lnc_idx, lnc_id in enumerate(test_lncrnas):
-        lnc_seq = lncrna_seqs_dict[lnc_id]
-        print(f"[{lnc_idx + 1}/{len(test_lncrnas)}] lncRNA: {lnc_id} "
-              f"({len(lnc_seq)} nt)")
-        results[lnc_id] = {}
-
-        for gene in shared_genes:
-            healthy_seq  = healthy_seqs_dict[gene]
-            gene_muts    = mutations_dict[gene]["mutations"]
-            mut_seqs     = mutated_seqs_dict.get(gene, [])
-            results[lnc_id][gene] = {}
-
-            # ── healthy run ───────────────────────────────────────────────
-            healthy_triplexes = long_target(para, lnc_seq, healthy_seq)
-            results[lnc_id][gene]["healthy"] = healthy_triplexes
-            total_hits += len(healthy_triplexes)
-
-            # ── mutated runs ──────────────────────────────────────────────
-            for mut_idx, (mut, mutated_seq) in enumerate(zip(gene_muts, mut_seqs)):
-                if mutated_seq is None:
-                    continue
-                mut_label = f"mut{mut_idx}_{mut.get('variant_class', 'unknown')}"
-                mutated_triplexes = long_target(para, lnc_seq, mutated_seq)
-                results[lnc_id][gene][mut_label] = mutated_triplexes
-                total_hits += len(mutated_triplexes)
-
-            total_pairs += 1
+    for lnc_id, gene, condition_dict in task_results:
+        results.setdefault(lnc_id, {})[gene] = condition_dict
+        total_hits  += sum(len(v) for v in condition_dict.values())
+        total_pairs += 1
 
     loop_end = datetime.now()
     elapsed  = loop_end - loop_start
@@ -397,7 +513,7 @@ def main(argv: List[str] = None) -> int:
     print(f"Total triplex hits across all runs:     {total_hits}")
 
     # ── write report ──────────────────────────────────────────────────────
-    report(results, mutations_dict, args.outpath)
+    report(results, mutations_dict, args.outpath, args.report_name)
 
     print("\nFinished normally.")
     return 0
