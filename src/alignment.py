@@ -6,20 +6,39 @@ Wires together:
   stats.py      → calc_score
   sim.py        → SIM, Triplex, cluster_triplex, print_cluster
   data_loader.py→ load_mutations, load_chrom_map,
-                  load_sequences, load_lncrnas
+                  load_sequences, load_lncrnas, load_mutation_windows
 
-Usage:
-  python alignment.py \
-    --genome      genomic.fna.gz \
-    --annotation  genomic.gtf.gz \
-    --assembly    assembly_report.txt \
-    --mutations   data_mutations.txt \
-    --lncrna      lncipedia_5_2_hc.fasta \
-    --outpath     ./results \
-    --lncrna_ids  FENDRR LINC01234
+Two search modes:
 
-  # Or pass a file with one ID per line:
-  python alignment.py ... --lncrna_ids_file my_lncrnas.txt
+  --mode window  (default)
+    Extracts a small window (±flank bp) around each mutation site.
+    The mutation is guaranteed to be in the center of the search region.
+    Dramatically faster and more likely to find differences between
+    healthy vs mutated conditions.
+
+  --mode gene  (original)
+    Searches the entire gene body. Preserves backward compatibility.
+
+Usage (window mode):
+  python alignment.py \\
+    --genome      genomic.fna.gz \\
+    --annotation  genomic.gtf.gz \\
+    --assembly    assembly_report.txt \\
+    --mutations   data_mutations.txt \\
+    --lncrna      lncipedia_5_2_hc.fasta \\
+    --outpath     ./results \\
+    --lncrna_ids  HOTAIR MALAT1 \\
+    --mut_flank   100
+
+Usage (gene mode, backward compat):
+  python alignment.py --mode gene \\
+    --genome      genomic.fna.gz \\
+    --annotation  genomic.gtf.gz \\
+    --assembly    assembly_report.txt \\
+    --mutations   data_mutations.txt \\
+    --lncrna      lncipedia_5_2_hc.fasta \\
+    --outpath     ./results \\
+    --lncrna_ids  HOTAIR MALAT1
 """
 
 import sys
@@ -37,7 +56,8 @@ from rules       import transfer_string, reverse_seq, complement
 from stats       import calc_score
 from sim         import SIM, Triplex, cluster_triplex, print_cluster
 from data_loader import (load_mutations, load_chrom_map,
-                         load_sequences, load_lncrnas)
+                         load_sequences, load_lncrnas,
+                         load_mutation_windows, load_clinical_sample_map)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,6 +294,154 @@ def _run_pair(args_tuple) -> Tuple[str, str, Dict[str, List[Triplex]]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multiprocessing worker for mutation-window mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_window(args_tuple) -> dict:
+    """
+    Worker for one (lnc_id, gene, mutation_window) triplet.
+
+    Runs long_target on both the healthy and mutated window sequences
+    so that differences caused by the mutation are directly comparable.
+
+    Returns a dict with all info needed for reporting.
+    """
+    para, lnc_id, lnc_seq, gene, window_rec = args_tuple
+
+    mut_idx     = window_rec["mut_idx"]
+    mut         = window_rec["mut"]
+    healthy_seq = window_rec["healthy_seq"]
+    mutated_seq = window_rec["mutated_seq"]
+    mut_label   = f"mut{mut_idx}_{mut.get('variant_class', 'unknown')}"
+
+    result = {
+        "lnc_id":       lnc_id,
+        "gene":         gene,
+        "mut_idx":      mut_idx,
+        "mut":          mut,
+        "window_start": window_rec["window_start"],
+        "window_end":   window_rec["window_end"],
+        "chromosome":   window_rec["chromosome"],
+        "strand":       window_rec["strand"],
+        "healthy_triplexes": [],
+        "mutated_triplexes": [],
+    }
+
+    if healthy_seq:
+        print(f"  [{lnc_id}] {gene} {mut_label} healthy_window ...", flush=True)
+        result["healthy_triplexes"] = long_target(para, lnc_seq, healthy_seq)
+
+    if mutated_seq:
+        print(f"  [{lnc_id}] {gene} {mut_label} mutated_window ...", flush=True)
+        result["mutated_triplexes"] = long_target(para, lnc_seq, mutated_seq)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report (mutation-window mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def report_windows(
+    window_results: List[dict],
+    outpath:        str,
+    report_name:    str = None,
+) -> None:
+    """
+    Write a CSV comparing healthy vs mutated triplex results for each
+    (lncRNA, gene, mutation) window.
+    """
+    os.makedirs(outpath, exist_ok=True)
+    if report_name is None:
+        report_name = f"triplex_windows_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    out_path = os.path.join(outpath, report_name)
+
+    fieldnames = [
+        "lnc_id", "gene", "sample_id",
+        "cancer_type", "cancer_type_detailed", "oncotree_code",
+        "variant_class", "variant_type",
+        "chromosome", "mut_start", "mut_end",
+        "window_start", "window_end", "strand",
+        # healthy
+        "healthy_n_triplexes", "healthy_mean_identity",
+        "healthy_mean_stability", "healthy_mean_score",
+        "healthy_min_nt", "healthy_max_nt",
+        # mutated
+        "mutated_n_triplexes", "mutated_mean_identity",
+        "mutated_mean_stability", "mutated_mean_score",
+        "mutated_min_nt", "mutated_max_nt",
+        # delta
+        "delta_n_triplexes", "delta_mean_score",
+    ]
+
+    rows = []
+    for wr in window_results:
+        mut = wr["mut"]
+
+        def _summarise(triplexes):
+            n = len(triplexes)
+            if n > 0:
+                return {
+                    "n":    n,
+                    "id":   round(sum(t.identity  for t in triplexes) / n, 4),
+                    "stab": round(sum(t.tri_score for t in triplexes) / n, 4),
+                    "sc":   round(sum(t.score     for t in triplexes) / n, 4),
+                    "mn":   min(t.nt for t in triplexes),
+                    "mx":   max(t.nt for t in triplexes),
+                }
+            return {"n": 0, "id": 0.0, "stab": 0.0, "sc": 0.0, "mn": 0, "mx": 0}
+
+        h = _summarise(wr["healthy_triplexes"])
+        m = _summarise(wr["mutated_triplexes"])
+
+        rows.append({
+            "lnc_id":           wr["lnc_id"],
+            "gene":             wr["gene"],
+            "sample_id":        mut.get("sample_id", ""),
+            "cancer_type":      mut.get("cancer_type", ""),
+            "cancer_type_detailed": mut.get("cancer_type_detailed", ""),
+            "oncotree_code":    mut.get("oncotree_code", ""),
+            "variant_class":    mut.get("variant_class", ""),
+            "variant_type":     mut.get("variant_type", ""),
+            "chromosome":       wr["chromosome"],
+            "mut_start":        mut.get("start", ""),
+            "mut_end":          mut.get("end", ""),
+            "window_start":     wr["window_start"],
+            "window_end":       wr["window_end"],
+            "strand":           wr["strand"],
+            "healthy_n_triplexes":    h["n"],
+            "healthy_mean_identity":  h["id"],
+            "healthy_mean_stability": h["stab"],
+            "healthy_mean_score":     h["sc"],
+            "healthy_min_nt":         h["mn"],
+            "healthy_max_nt":         h["mx"],
+            "mutated_n_triplexes":    m["n"],
+            "mutated_mean_identity":  m["id"],
+            "mutated_mean_stability": m["stab"],
+            "mutated_mean_score":     m["sc"],
+            "mutated_min_nt":         m["mn"],
+            "mutated_max_nt":         m["mx"],
+            "delta_n_triplexes":      m["n"] - h["n"],
+            "delta_mean_score":       round(m["sc"] - h["sc"], 4),
+        })
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Summary stats
+    n_with_any = sum(1 for r in rows
+                     if r["healthy_n_triplexes"] > 0 or r["mutated_n_triplexes"] > 0)
+    n_diff = sum(1 for r in rows
+                 if r["delta_n_triplexes"] != 0 or r["delta_mean_score"] != 0)
+
+    print(f"Report written → {out_path}  ({len(rows)} rows)")
+    print(f"  Windows with any triplexes:  {n_with_any}")
+    print(f"  Windows with h/m differences: {n_diff}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Report
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -289,7 +457,9 @@ def report(
     out_path = os.path.join(outpath, report_name)
 
     fieldnames = [
-        "lnc_id", "gene", "condition", "variant_class", "chromosome",
+        "lnc_id", "gene", "condition", "variant_class",
+        "sample_id", "cancer_type", "cancer_type_detailed", "oncotree_code",
+        "chromosome",
         "n_triplexes", "mean_identity", "mean_stability", "mean_score",
         "min_nt", "max_nt",
     ]
@@ -299,8 +469,8 @@ def report(
         for gene, condition_dict in gene_dict.items():
             gene_info  = mutations_dict.get(gene, {})
             chromosome = gene_info.get("chromosome", "")
-            mutations  = {
-                f"mut{i}_{m.get('variant_class', 'unknown')}": m.get("variant_class", "")
+            mutations_lookup  = {
+                f"mut{i}_{m.get('variant_class', 'unknown')}": m
                 for i, m in enumerate(gene_info.get("mutations", []))
             }
 
@@ -316,11 +486,17 @@ def report(
                     mean_identity = mean_stability = mean_score = 0.0
                     min_nt = max_nt = 0
 
+                mut_rec = mutations_lookup.get(condition, {})
+
                 rows.append({
                     "lnc_id":         lnc_id,
                     "gene":           gene,
                     "condition":      condition,
-                    "variant_class":  mutations.get(condition, "healthy" if condition == "healthy" else ""),
+                    "variant_class":  mut_rec.get("variant_class", "healthy" if condition == "healthy" else ""),
+                    "sample_id":      mut_rec.get("sample_id", ""),
+                    "cancer_type":    mut_rec.get("cancer_type", ""),
+                    "cancer_type_detailed": mut_rec.get("cancer_type_detailed", ""),
+                    "oncotree_code":  mut_rec.get("oncotree_code", ""),
                     "chromosome":     chromosome,
                     "n_triplexes":    n,
                     "mean_identity":  round(mean_identity,  4),
@@ -351,6 +527,9 @@ def parse_args(argv: List[str]) -> Tuple[Para, argparse.Namespace]:
     parser.add_argument("--annotation", required=True, metavar="GTF")
     parser.add_argument("--assembly",   required=True, metavar="ASSEMBLY_REPORT")
     parser.add_argument("--lncrna",     required=True, metavar="FASTA")
+    parser.add_argument("--clinical",   default=None, metavar="CLINICAL_FILE",
+                        help="cBioPortal data_clinical_sample.txt file. "
+                             "Adds cancer_type to each mutation in the report.")
 
     # ── lncRNA selection ──────────────────────────────────────────────────
     lnc_group = parser.add_mutually_exclusive_group()
@@ -360,6 +539,14 @@ def parse_args(argv: List[str]) -> Tuple[Para, argparse.Namespace]:
     # ── runtime ───────────────────────────────────────────────────────────
     parser.add_argument("--n_cores", type=int, default=1, metavar="N",
                         help="Number of worker processes (default: 1).")
+
+    # ── search mode ───────────────────────────────────────────────────────
+    parser.add_argument("--mode", choices=["gene", "window"], default="window",
+                        help="Search mode: 'gene' = whole gene body (original), "
+                             "'window' = mutation-centered window (default).")
+    parser.add_argument("--mut_flank", type=int, default=100, metavar="BP",
+                        help="Bases on each side of mutation for window mode "
+                             "(default: 100). Total window = 2 * flank + 1.")
 
     # ── reporting ─────────────────────────────────────────────────────────
     parser.add_argument("--outpath",    default="./results")
@@ -414,43 +601,29 @@ def main(argv: List[str] = None) -> int:
 
     os.makedirs(args.outpath, exist_ok=True)
     print(f"Output directory: {args.outpath}")
+    print(f"Search mode:      {args.mode}")
 
     # ── load data ─────────────────────────────────────────────────────────
+    clinical_map = None
+    if args.clinical:
+        print("Loading clinical sample data ...")
+        clinical_map = load_clinical_sample_map(args.clinical)
+
     print("Loading mutated gene data ...")
-    mutations_dict, gene_names = load_mutations(args.mutations)
+    mutations_dict, gene_names = load_mutations(args.mutations, clinical_map)
 
     print("Building chromosome map ...")
     chrom_map = load_chrom_map(args.assembly)
 
-    print("Loading gene sequences ...")
-    healthy_seqs_dict, mutated_seqs_dict = load_sequences(
-        fasta_path     = args.genome,
-        gtf_path       = args.annotation,
-        gene_names     = gene_names,
-        chrom_map      = chrom_map,
-        mutations_dict = mutations_dict,
-    )
-    del chrom_map, gene_names
-    gc.collect()
-
     print("Loading lncRNA sequences ...")
     lncrna_seqs_dict = load_lncrnas(args.lncrna)
 
-    # Restrict sequence dicts to only genes present in mutations_dict
-    shared_gene_set   = set(mutations_dict.keys()) & set(healthy_seqs_dict.keys())
-    healthy_seqs_dict = {g: healthy_seqs_dict[g] for g in shared_gene_set}
-    mutated_seqs_dict = {g: mutated_seqs_dict[g] for g in shared_gene_set
-                         if g in mutated_seqs_dict}
-    gc.collect()
-
-    # Resolve lncRNA IDs → flat list of "base_id:version" strings
+    # Resolve lncRNA IDs
     test_lncrnas = resolve_lncrna_ids(
         lncrna_seqs_dict,
         ids      = args.lncrna_ids,
         ids_file = args.lncrna_ids_file,
     )
-
-    # Keep only the lncRNAs we will actually use: {lnc_id: sequence}
     filtered_lncrna_seqs_dict = {}
     for lnc_id in test_lncrnas:
         base_id, ver_str = lnc_id.rsplit(":", 1)
@@ -458,62 +631,124 @@ def main(argv: List[str] = None) -> int:
     del lncrna_seqs_dict
     gc.collect()
 
-    print(f"\n=== Data Summary ===")
-    print(f"  Genes with mutations:     {len(mutations_dict)}")
-    print(f"  Gene sequences retrieved: {len(healthy_seqs_dict)}")
-    print(f"  lncRNA transcripts:       {len(filtered_lncrna_seqs_dict)}")
-
-    shared_genes = sorted(shared_gene_set)
-
-    print(f"\n  Genes available for analysis: {len(shared_genes)}")
-    print(f"  lncRNAs to test:              {len(test_lncrnas)}")
-    print(f"  Workers:                      {args.n_cores}")
-    print(f"\n=== Memory Summary ===")
-    print(f"  healthy_seqs_dict: {asizeof.asizeof(healthy_seqs_dict) / 1e6:.2f} MB")
-    print(f"  mutated_seqs_dict: {asizeof.asizeof(mutated_seqs_dict) / 1e6:.2f} MB")
-
-    # ── build task list ───────────────────────────────────────────────────
-    tasks = [
-        (
-            para,
-            lnc_id,
-            filtered_lncrna_seqs_dict[lnc_id],
-            gene,
-            healthy_seqs_dict[gene],
-            mutations_dict[gene]["mutations"],
-            mutated_seqs_dict.get(gene, []),
+    # ── WINDOW MODE ───────────────────────────────────────────────────────
+    if args.mode == "window":
+        print(f"\nLoading mutation-centered windows (flank={args.mut_flank}bp) ...")
+        windows_dict = load_mutation_windows(
+            fasta_path     = args.genome,
+            gtf_path       = args.annotation,
+            chrom_map      = chrom_map,
+            mutations_dict = mutations_dict,
+            mut_flank      = args.mut_flank,
         )
-        for lnc_id in test_lncrnas
-        for gene   in shared_genes
-    ]
+        del chrom_map
+        gc.collect()
 
-    # ── run ───────────────────────────────────────────────────────────────
-    loop_start = datetime.now()
-    print(f"\nLoop started at: {loop_start.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        # Build task list: one task per (lnc, gene, mutation_window)
+        tasks = []
+        for lnc_id in test_lncrnas:
+            lnc_seq = filtered_lncrna_seqs_dict[lnc_id]
+            for gene, window_records in windows_dict.items():
+                for wr in window_records:
+                    if wr["healthy_seq"] is None:
+                        continue
+                    tasks.append((para, lnc_id, lnc_seq, gene, wr))
 
-    with Pool(processes=args.n_cores) as pool:
-        task_results = pool.map(_run_pair, tasks)
+        total_windows = sum(len(wrs) for wrs in windows_dict.values())
+        print(f"\n=== Data Summary (window mode) ===")
+        print(f"  Genes with mutations:   {len(mutations_dict)}")
+        print(f"  Mutation windows built: {total_windows}")
+        print(f"  lncRNAs to test:        {len(test_lncrnas)}")
+        print(f"  Total tasks:            {len(tasks)}")
+        print(f"  Window size:            ±{args.mut_flank}bp "
+              f"(~{2 * args.mut_flank + 1}bp)")
+        print(f"  Workers:                {args.n_cores}")
 
-    # Re-nest results into {lnc_id: {gene: {condition: [Triplex]}}}
-    results:     Dict[str, Dict[str, Dict[str, List[Triplex]]]] = {}
-    total_pairs = 0
-    total_hits  = 0
+        loop_start = datetime.now()
+        print(f"\nLoop started at: {loop_start.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    for lnc_id, gene, condition_dict in task_results:
-        results.setdefault(lnc_id, {})[gene] = condition_dict
-        total_hits  += sum(len(v) for v in condition_dict.values())
-        total_pairs += 1
+        with Pool(processes=args.n_cores) as pool:
+            window_results = pool.map(_run_window, tasks)
 
-    loop_end = datetime.now()
-    elapsed  = loop_end - loop_start
+        loop_end = datetime.now()
+        elapsed  = loop_end - loop_start
 
-    print(f"\nLoop ended at:   {loop_end.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Elapsed time:    {elapsed}")
-    print(f"Total (lncRNA × gene) pairs processed: {total_pairs}")
-    print(f"Total triplex hits across all runs:     {total_hits}")
+        print(f"\nLoop ended at:   {loop_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Elapsed time:    {elapsed}")
+        print(f"Total window tasks processed: {len(window_results)}")
 
-    # ── write report ──────────────────────────────────────────────────────
-    report(results, mutations_dict, args.outpath, args.report_name)
+        report_windows(window_results, args.outpath, args.report_name)
+
+    # ── GENE MODE (original) ─────────────────────────────────────────────
+    else:
+        print("Loading gene sequences ...")
+        healthy_seqs_dict, mutated_seqs_dict = load_sequences(
+            fasta_path     = args.genome,
+            gtf_path       = args.annotation,
+            gene_names     = gene_names,
+            chrom_map      = chrom_map,
+            mutations_dict = mutations_dict,
+        )
+        del chrom_map, gene_names
+        gc.collect()
+
+        shared_gene_set   = set(mutations_dict.keys()) & set(healthy_seqs_dict.keys())
+        healthy_seqs_dict = {g: healthy_seqs_dict[g] for g in shared_gene_set}
+        mutated_seqs_dict = {g: mutated_seqs_dict[g] for g in shared_gene_set
+                             if g in mutated_seqs_dict}
+        gc.collect()
+
+        shared_genes = sorted(shared_gene_set)
+
+        print(f"\n=== Data Summary (gene mode) ===")
+        print(f"  Genes with mutations:     {len(mutations_dict)}")
+        print(f"  Gene sequences retrieved: {len(healthy_seqs_dict)}")
+        print(f"  lncRNA transcripts:       {len(filtered_lncrna_seqs_dict)}")
+        print(f"\n  Genes available for analysis: {len(shared_genes)}")
+        print(f"  lncRNAs to test:              {len(test_lncrnas)}")
+        print(f"  Workers:                      {args.n_cores}")
+        print(f"\n=== Memory Summary ===")
+        print(f"  healthy_seqs_dict: {asizeof.asizeof(healthy_seqs_dict) / 1e6:.2f} MB")
+        print(f"  mutated_seqs_dict: {asizeof.asizeof(mutated_seqs_dict) / 1e6:.2f} MB")
+
+        tasks = [
+            (
+                para,
+                lnc_id,
+                filtered_lncrna_seqs_dict[lnc_id],
+                gene,
+                healthy_seqs_dict[gene],
+                mutations_dict[gene]["mutations"],
+                mutated_seqs_dict.get(gene, []),
+            )
+            for lnc_id in test_lncrnas
+            for gene   in shared_genes
+        ]
+
+        loop_start = datetime.now()
+        print(f"\nLoop started at: {loop_start.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        with Pool(processes=args.n_cores) as pool:
+            task_results = pool.map(_run_pair, tasks)
+
+        results:     Dict[str, Dict[str, Dict[str, List[Triplex]]]] = {}
+        total_pairs = 0
+        total_hits  = 0
+
+        for lnc_id, gene, condition_dict in task_results:
+            results.setdefault(lnc_id, {})[gene] = condition_dict
+            total_hits  += sum(len(v) for v in condition_dict.values())
+            total_pairs += 1
+
+        loop_end = datetime.now()
+        elapsed  = loop_end - loop_start
+
+        print(f"\nLoop ended at:   {loop_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Elapsed time:    {elapsed}")
+        print(f"Total (lncRNA × gene) pairs processed: {total_pairs}")
+        print(f"Total triplex hits across all runs:     {total_hits}")
+
+        report(results, mutations_dict, args.outpath, args.report_name)
 
     print("\nFinished normally.")
     return 0
