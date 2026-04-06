@@ -47,12 +47,62 @@ MAF_COLS = [
     "Variant_Type",
     "Reference_Allele",
     "Tumor_Seq_Allele2",
+    "Tumor_Sample_Barcode",
 ]
 
 
-def load_mutations(filepaths: list[str]) -> tuple[dict, set]:
+def load_clinical_sample_map(filepath: str) -> dict[str, dict[str, str]]:
+    """
+    Parse a cBioPortal data_clinical_sample.txt file.
+
+    Returns
+    -------
+    sample_map : {SAMPLE_ID: {"cancer_type": str, "cancer_type_detailed": str}}
+    """
+    p = Path(filepath)
+    if not p.exists():
+        raise FileNotFoundError(f"Clinical sample file not found: {filepath}")
+
+    df = pd.read_csv(p, sep="\t", comment="#", low_memory=False)
+
+    # Normalise column names — cBioPortal uses uppercase
+    col_map = {c.upper(): c for c in df.columns}
+    id_col      = col_map.get("SAMPLE_ID")
+    ct_col      = col_map.get("CANCER_TYPE")
+    ctd_col     = col_map.get("CANCER_TYPE_DETAILED")
+    oncotree_col = col_map.get("ONCOTREE_CODE")
+
+    if id_col is None:
+        raise ValueError("Clinical file has no SAMPLE_ID column.")
+
+    sample_map: dict[str, dict[str, str]] = {}
+    for row in df.itertuples(index=False):
+        sid = str(getattr(row, id_col, "")).strip()
+        if not sid:
+            continue
+        sample_map[sid] = {
+            "cancer_type":          str(getattr(row, ct_col, "")).strip()      if ct_col      else "",
+            "cancer_type_detailed": str(getattr(row, ctd_col, "")).strip()     if ctd_col     else "",
+            "oncotree_code":        str(getattr(row, oncotree_col, "")).strip() if oncotree_col else "",
+        }
+
+    print(f"[INFO] Loaded clinical data for {len(sample_map)} samples.")
+    return sample_map
+
+
+def load_mutations(
+    filepaths:  list[str],
+    clinical_map: dict[str, dict[str, str]] | None = None,
+) -> tuple[dict, set]:
     """
     Parse one or more cBioPortal MAF files.
+
+    Parameters
+    ----------
+    filepaths    : paths to MAF / data_mutations.txt files
+    clinical_map : optional {SAMPLE_ID: {"cancer_type": ..., ...}} from
+                   load_clinical_sample_map().  When provided, each mutation
+                   record is annotated with cancer_type fields.
 
     Returns
     -------
@@ -63,22 +113,28 @@ def load_mutations(filepaths: list[str]) -> tuple[dict, set]:
             "chromosome": str,
             "mutations": [
                 {
-                  "start":         int,       # genomic start (1-based, inclusive)
-                  "end":           int,       # genomic end   (1-based, inclusive)
-                  "strand":        str,       # "+" or "-" (MAF strand)
-                  "reference_allele": str,    # ref bases at this locus
-                  "alt_allele":    str,       # somatic alt (Tumor_Seq_Allele2)
+                  "start":         int,
+                  "end":           int,
+                  "strand":        str,
+                  "reference_allele": str,
+                  "alt_allele":    str,
                   "consequence":   str,
                   "variant_class": str,
-                  "variant_type":  str,       # SNP | DNP | ONP | INS | DEL
+                  "variant_type":  str,
+                  "sample_id":     str,
+                  "cancer_type":   str,
+                  "cancer_type_detailed": str,
+                  "oncotree_code": str,
                 },
                 ...
             ]
           }
         }
     gene_names : set[str]
-        Flat set of all Hugo symbols — convenient for downstream filtering.
     """
+    if clinical_map is None:
+        clinical_map = {}
+
     frames = []
     for fp in filepaths:
         p = Path(fp)
@@ -102,8 +158,11 @@ def load_mutations(filepaths: list[str]) -> tuple[dict, set]:
     combined["Hugo_Symbol"] = combined["Hugo_Symbol"].str.strip()
 
     mutations_dict: dict = {}
+    matched_samples = 0
+    total_rows      = 0
 
     for row in combined.itertuples(index=False):
+        total_rows += 1
         sym = row.Hugo_Symbol
         if sym not in mutations_dict:
             mutations_dict[sym] = {
@@ -111,6 +170,11 @@ def load_mutations(filepaths: list[str]) -> tuple[dict, set]:
                 "chromosome": str(getattr(row, "Chromosome", "")).strip(),
                 "mutations":  [],
             }
+
+        sample_id = str(getattr(row, "Tumor_Sample_Barcode", "")).strip()
+        clin      = clinical_map.get(sample_id, {})
+        if clin:
+            matched_samples += 1
 
         mut_record = {
             "start":            _safe_int(getattr(row, "Start_Position", None)),
@@ -121,12 +185,18 @@ def load_mutations(filepaths: list[str]) -> tuple[dict, set]:
             "consequence":      str(getattr(row, "Consequence",            "")).strip(),
             "variant_class":    str(getattr(row, "Variant_Classification", "")).strip(),
             "variant_type":     str(getattr(row, "Variant_Type",           "")).strip(),
+            "sample_id":        sample_id,
+            "cancer_type":          clin.get("cancer_type", ""),
+            "cancer_type_detailed": clin.get("cancer_type_detailed", ""),
+            "oncotree_code":        clin.get("oncotree_code", ""),
         }
         mutations_dict[sym]["mutations"].append(mut_record)
 
     gene_names = set(mutations_dict.keys())
-    print(f"[INFO] Loaded {len(gene_names)} unique mutated genes from "
-          f"{len(filepaths)} file(s).")
+    print(f"[INFO] Loaded {len(gene_names)} unique mutated genes "
+          f"({total_rows} mutation rows) from {len(filepaths)} file(s).")
+    if clinical_map:
+        print(f"[INFO] Matched {matched_samples}/{total_rows} mutations to clinical data.")
     return mutations_dict, gene_names
 
 
@@ -433,6 +503,225 @@ def load_lncrnas(fasta_path: str) -> dict[str, dict[int, str]]:
     print(f"[INFO] Loaded {len(lncrna_seqs_dict)} lncRNA base IDs "
           f"({n_transcripts} total versioned transcripts).")
     return lncrna_seqs_dict
+
+# ---------------------------------------------------------------------------
+# 3b. Load mutation-centered windows (focused search around each mutation)
+# ---------------------------------------------------------------------------
+
+def load_mutation_windows(
+    fasta_path:     str,
+    gtf_path:       str,
+    chrom_map:      dict[str, str],
+    mutations_dict: dict,
+    mut_flank:      int = 100,
+) -> dict[str, list[dict]]:
+    """
+    For each mutation in mutations_dict, extract a focused genomic window
+    centered on the mutation site: [mut_pos - flank, mut_pos + flank].
+
+    This replaces load_sequences() for the mutation-window search mode.
+    Instead of extracting entire gene bodies (10k-500k bp), we extract
+    small windows (~200-1000 bp) where the mutation is guaranteed to be
+    in the center of the search region.
+
+    Parameters
+    ----------
+    fasta_path     : NCBI RefSeq genomic FASTA (.fna or bgzipped .fna.gz)
+    gtf_path       : Matching NCBI RefSeq GTF annotation file
+    chrom_map      : {bare/prefixed chrom name → RefSeq accession}
+    mutations_dict : output of load_mutations
+    mut_flank      : bases on each side of the mutation (default 100)
+
+    Returns
+    -------
+    windows_dict : {Hugo_Symbol: [window_record, ...]}
+        Each window_record is a dict:
+        {
+            "mut_idx":        int,
+            "mut":            dict,           # original mutation record
+            "healthy_seq":    str,            # reference window sequence
+            "mutated_seq":    str | None,     # mutated window sequence
+            "window_start":   int,            # genomic start of window (1-based)
+            "window_end":     int,            # genomic end of window (1-based)
+            "chromosome":     str,            # RefSeq chrom accession
+            "strand":         str,            # gene strand from GTF ("+" or "-")
+        }
+        A window_record with mutated_seq=None means ref-allele verification
+        failed for that mutation.
+    """
+    fasta_path = ensure_bgzipped(fasta_path)
+    print("[INFO] Indexing genome FASTA …")
+    genome = Fasta(fasta_path, sequence_always_upper=True)
+
+    # We still need GTF to know which strand the gene is on,
+    # so triplex orientation is correct.
+    gene_names = set(mutations_dict.keys())
+    print("[INFO] Parsing GTF annotation (for strand info) …")
+    gene_intervals = _parse_gtf_for_genes(gtf_path, gene_names)
+
+    # Build gene → (chrom_accession, strand) lookup
+    gene_strand: dict[str, tuple[str, str]] = {}
+    for sym, intervals in gene_intervals.items():
+        # Pick the longest interval (same logic as load_sequences)
+        chrom, g_start, g_end, strand = max(
+            intervals, key=lambda x: x[2] - x[1])
+        refseq_chrom = chrom_map.get(chrom, chrom)
+        gene_strand[sym] = (refseq_chrom, strand)
+
+    windows_dict: dict[str, list[dict]] = {}
+    missing_chrom:  list[str] = []
+    ref_mismatches: list[tuple] = []
+    total_windows  = 0
+    valid_windows  = 0
+
+    for sym, gene_info in mutations_dict.items():
+        mutations = gene_info.get("mutations", [])
+        if not mutations:
+            continue
+
+        # Resolve chromosome for this gene.
+        # Strategy: prefer the MAF chromosome field (which matches mutation coords)
+        # resolved through chrom_map, then fall back to GTF.
+        chrom_raw = gene_info.get("chromosome", "").strip()
+        refseq_chrom = None
+        strand = "+"
+
+        # 1) Try MAF chromosome → chrom_map (most reliable for mutation coords)
+        if chrom_raw:
+            refseq_chrom = chrom_map.get(chrom_raw, chrom_map.get(f"chr{chrom_raw}", None))
+
+        # 2) Fall back to GTF-derived chromosome
+        if refseq_chrom is None and sym in gene_strand:
+            refseq_chrom, strand = gene_strand[sym]
+
+        # Get strand from GTF if available (regardless of chrom source)
+        if sym in gene_strand:
+            _, strand = gene_strand[sym]
+
+        if refseq_chrom is None:
+            missing_chrom.append(sym)
+            continue
+
+        # Verify chromosome exists in FASTA
+        if refseq_chrom not in genome:
+            missing_chrom.append(sym)
+            continue
+
+        chrom_len = len(genome[refseq_chrom])
+        window_records: list[dict] = []
+
+        for mut_idx, mut in enumerate(mutations):
+            total_windows += 1
+            m_start = mut["start"]   # genomic, 1-based inclusive
+            m_end   = mut["end"]     # genomic, 1-based inclusive
+            ref_al  = mut["reference_allele"]
+            alt_al  = mut["alt_allele"]
+            vtype   = mut["variant_type"].upper()
+
+            if m_start is None or m_end is None:
+                window_records.append({
+                    "mut_idx": mut_idx, "mut": mut,
+                    "healthy_seq": None, "mutated_seq": None,
+                    "window_start": 0, "window_end": 0,
+                    "chromosome": refseq_chrom, "strand": strand,
+                })
+                continue
+
+            # Compute window boundaries (1-based, clamp to chromosome)
+            mut_center = (m_start + m_end) // 2
+            win_start  = max(1, mut_center - mut_flank)
+            win_end    = min(chrom_len, mut_center + mut_flank)
+
+            # Validate: mutation must be within the chromosome bounds
+            if win_start >= win_end or m_start > chrom_len or m_end > chrom_len:
+                print(f"[WARNING] {sym} mut{mut_idx}: mutation coords "
+                      f"({m_start}-{m_end}) exceed chromosome length "
+                      f"({chrom_len}) for {refseq_chrom}, skipping.",
+                      file=sys.stderr)
+                window_records.append({
+                    "mut_idx": mut_idx, "mut": mut,
+                    "healthy_seq": None, "mutated_seq": None,
+                    "window_start": win_start, "window_end": win_end,
+                    "chromosome": refseq_chrom, "strand": strand,
+                })
+                continue
+
+            # Extract reference window (pyfaidx is 0-based slicing)
+            raw_window = str(genome[refseq_chrom][win_start - 1 : win_end])
+
+            # Convert mutation coords to local offsets within window
+            local_start = m_start - win_start   # 0-based
+            local_end   = m_end   - win_start   # 0-based inclusive
+
+            # Bounds check: mutation must be fully within window
+            if local_start < 0 or local_end >= len(raw_window):
+                print(f"[WARNING] {sym} mut{mut_idx}: mutation extends "
+                      f"beyond window, skipping.", file=sys.stderr)
+                window_records.append({
+                    "mut_idx": mut_idx, "mut": mut,
+                    "healthy_seq": raw_window if strand == "+" else _reverse_complement(raw_window),
+                    "mutated_seq": None,
+                    "window_start": win_start, "window_end": win_end,
+                    "chromosome": refseq_chrom, "strand": strand,
+                })
+                continue
+
+            # Ref-allele verification (skip for insertions where ref is "-")
+            if vtype != "INS":
+                actual_ref = raw_window[local_start : local_end + 1]
+                if actual_ref != ref_al:
+                    ref_mismatches.append((sym, mut_idx, ref_al, actual_ref))
+                    window_records.append({
+                        "mut_idx": mut_idx, "mut": mut,
+                        "healthy_seq": raw_window if strand == "+" else _reverse_complement(raw_window),
+                        "mutated_seq": None,
+                        "window_start": win_start, "window_end": win_end,
+                        "chromosome": refseq_chrom, "strand": strand,
+                    })
+                    continue
+
+            # Apply mutation to window
+            if vtype == "INS":
+                mutated_raw = (raw_window[: local_start + 1]
+                               + alt_al
+                               + raw_window[local_start + 1 :])
+            elif vtype == "DEL":
+                mutated_raw = raw_window[: local_start] + raw_window[local_end + 1 :]
+            else:
+                # SNP / DNP / ONP
+                mutated_raw = raw_window[: local_start] + alt_al + raw_window[local_end + 1 :]
+
+            # Apply strand orientation
+            healthy_seq = raw_window   if strand == "+" else _reverse_complement(raw_window)
+            mutated_seq = mutated_raw  if strand == "+" else _reverse_complement(mutated_raw)
+
+            window_records.append({
+                "mut_idx":      mut_idx,
+                "mut":          mut,
+                "healthy_seq":  healthy_seq,
+                "mutated_seq":  mutated_seq,
+                "window_start": win_start,
+                "window_end":   win_end,
+                "chromosome":   refseq_chrom,
+                "strand":       strand,
+            })
+            valid_windows += 1
+
+        windows_dict[sym] = window_records
+
+    # Summary
+    if missing_chrom:
+        print(f"[WARNING] Chromosome not found for {len(missing_chrom)} genes: "
+              f"{missing_chrom[:10]}{'...' if len(missing_chrom) > 10 else ''}",
+              file=sys.stderr)
+    if ref_mismatches:
+        print(f"[WARNING] {len(ref_mismatches)} mutations skipped (ref-allele mismatch).",
+              file=sys.stderr)
+
+    print(f"[INFO] Built {valid_windows}/{total_windows} mutation windows "
+          f"(flank={mut_flank}bp) across {len(windows_dict)} genes.")
+    return windows_dict
+
 
 # ---------------------------------------------------------------------------
 # Utilities
