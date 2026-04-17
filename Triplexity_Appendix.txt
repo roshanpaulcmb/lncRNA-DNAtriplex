@@ -1,0 +1,58 @@
+Appendix
+
+Input Parameters:
+
+-- dna: multi-FASTA file of DNA target sequences (required)
+
+-- rna: single-entry FASTA file of the lncRNA query sequence (required)
+
+-- out: output directory for results (default: longtarget_results/)
+
+-- jobs: number of parallel worker processes (default: 1)
+
+-- strand: strand orientation to search; 0 = both, 1 = parallel only, -1 = antiparallel only (default: 0)
+
+-- rule: triplex rule to apply; 0 = all rules, 1–6 = specific parallel rule, 1–18 = specific antiparallel rule (default: 0)
+
+-- nt-min: minimum triplex length in base pairs; literature consensus from Moser & Dervan for experimentally validated triplexes (default: 15 bp)
+
+-- nt-max: maximum triplex length in base pairs (default: 100,000 bp)
+
+-- identity: minimum alignment identity percentage (default: 40%)
+
+-- stability: minimum mean thermodynamic stability score; values above 1.0 indicate near-canonical Hoogsteen binding dominated by high-weight base triplets (default: 0.4)
+
+-- penalty-t: penalty applied to consecutive A•A:T triplets, which destabilise triplexes in vivo (default: -1000)
+
+-- penalty-c: penalty applied to consecutive G•G:C triplets (default: 0)
+
+-- cut-length: DNA chunk size in bp for processing long genomic sequences (default: 5,000 bp)
+
+-- overlap: overlap between consecutive DNA chunks in bp, preventing hits at chunk boundaries from being missed (default: 100 bp)
+
+
+Output CSV:
+
+One row per gene per mutation, containing the following fields:
+
+-- lnc_id: the lncRNA identifier and domain used for triplex prediction (e.g. HOTAIR:3)
+
+-- gene: target gene name
+
+-- condition: whether the sequence is a healthy reference or a mutant (e.g. healthy, mut0_Missense_Mutation)
+
+-- variant_class: the class of mutation in the mutant condition (e.g. Missense_Mutation, Silent, Frame_Shift_Del)
+
+-- chromosome: chromosome on which the target gene is located
+
+-- n_triplexes: total number of triplex hits predicted at this locus above the stability and identity thresholds
+
+-- mean_identity: mean alignment identity percentage across all predicted triplex hits for this gene
+
+-- mean_stability: mean thermodynamic stability score across all predicted triplex hits; values above 1.0 indicate near-canonical Hoogsteen binding dominated by high-weight base triplets
+
+-- mean_score: mean Smith-Waterman alignment score normalised by triplex length across all hits
+
+-- min_nt: length in base pairs of the shortest triplex hit predicted for this gene
+
+-- max_nt: length in base pairs of the longest triplex hit predicted for this gene
