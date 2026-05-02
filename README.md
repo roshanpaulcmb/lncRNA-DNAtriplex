@@ -1,4 +1,4 @@
-# lncRNA-DNAtriplex
+# Triplexity
 
 A computational pipeline for predicting lncRNA–DNA triplex formation at somatic mutation sites in cancer genomes.
 
@@ -40,10 +40,10 @@ python src/alignment.py \
   --mode         window \
   --outpath      ./results \
   --report_name  my_results.csv \
-  -n_cores       8
+  --n_cores      8
 ```
 
-The pipeline supports multiprocessing via the `-n_cores` flag, distributing lncRNA–gene pair computations across multiple CPU cores to significantly reduce runtime on large datasets. See `example.ipynb` for a walkthrough.
+The pipeline supports multiprocessing via the `--n_cores` flag, distributing lncRNA–gene pair computations across multiple CPU cores to significantly reduce runtime on large datasets. See `notebooks/example.ipynb` for a walkthrough.
 
 ## Data Sources
 
